@@ -1,6 +1,6 @@
 /**
- * AgentPanelWidget — The Cursor-style AI chat panel.
- * Rendered on the right side of the IDE.
+ * AgentPanelWidget — Cursor-style AI chat panel.
+ * Wires real IDE context: board FQBN, port, sketch path, serial buffer.
  */
 
 import * as React from '@theia/core/shared/react';
@@ -10,7 +10,7 @@ import {
   postConstruct,
 } from '@theia/core/shared/inversify';
 import { ReactWidget, Message } from '@theia/core/lib/browser';
-import { nls } from '@theia/core/lib/common';
+import { WebSocketConnectionProvider } from '@theia/core/lib/browser/messaging/ws-connection-provider';
 import {
   AgentService,
   AgentServicePath,
@@ -18,7 +18,9 @@ import {
   AgentMessage,
   AgentContext,
 } from '../../common/protocol/agent-service';
-import { WebSocketConnectionProvider } from '@theia/core/lib/browser/messaging/ws-connection-provider';
+import { BoardsServiceProvider } from '../boards/boards-service-provider';
+import { SketchesServiceClientImpl } from '../sketches-service-client-impl';
+import { MonitorModel } from '../monitor-model';
 
 export const AGENT_PANEL_WIDGET_ID = 'arduino-agent-panel';
 export const AGENT_PANEL_WIDGET_LABEL = 'AI Agent';
@@ -41,6 +43,15 @@ export class AgentPanelWidget extends ReactWidget implements AgentServiceClient 
   @inject(WebSocketConnectionProvider)
   private readonly connectionProvider: WebSocketConnectionProvider;
 
+  @inject(BoardsServiceProvider)
+  private readonly boardsServiceProvider: BoardsServiceProvider;
+
+  @inject(SketchesServiceClientImpl)
+  private readonly sketchesClient: SketchesServiceClientImpl;
+
+  @inject(MonitorModel)
+  private readonly monitorModel: MonitorModel;
+
   private agentService!: AgentService;
 
   private state: ChatState = {
@@ -57,12 +68,12 @@ export class AgentPanelWidget extends ReactWidget implements AgentServiceClient 
   protected init(): void {
     this.id = AGENT_PANEL_WIDGET_ID;
     this.title.label = AGENT_PANEL_WIDGET_LABEL;
-    this.title.caption = 'ArduinoIDE Agent — Agentic AI Assistant';
+    this.title.caption = 'ArduinoIDE Agent — AI-powered embedded development';
     this.title.iconClass = 'codicon codicon-robot';
     this.title.closable = true;
     this.addClass('agent-panel-widget');
 
-    // Connect to backend AgentService via JSON-RPC
+    // Connect to backend via JSON-RPC (this widget IS the notification client)
     this.agentService = this.connectionProvider.createProxy<AgentService>(
       AgentServicePath,
       this as AgentServiceClient
@@ -86,7 +97,12 @@ export class AgentPanelWidget extends ReactWidget implements AgentServiceClient 
     this.setState({ activeToolName: toolName });
   }
 
-  onToolEnd(_sessionId: string, _toolName: string, _result: string, _success: boolean): void {
+  onToolEnd(
+    _sessionId: string,
+    _toolName: string,
+    _result: string,
+    _success: boolean
+  ): void {
     this.setState({ activeToolName: null });
   }
 
@@ -114,18 +130,22 @@ export class AgentPanelWidget extends ReactWidget implements AgentServiceClient 
 
   // ── Event handlers ────────────────────────────────────────────────────────
 
-  private handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+  private readonly handleInputChange = (
+    e: React.ChangeEvent<HTMLTextAreaElement>
+  ) => {
     this.setState({ input: e.target.value, error: null });
   };
 
-  private handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+  private readonly handleKeyDown = (
+    e: React.KeyboardEvent<HTMLTextAreaElement>
+  ) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       this.sendMessage();
     }
   };
 
-  private sendMessage = async () => {
+  private readonly sendMessage = async () => {
     const { input, isRunning, sessionId } = this.state;
     if (!input.trim() || isRunning || !sessionId) return;
 
@@ -140,44 +160,89 @@ export class AgentPanelWidget extends ReactWidget implements AgentServiceClient 
     }
   };
 
-  private handleAbort = async () => {
+  private readonly handleAbort = async () => {
     if (this.state.sessionId) {
       await this.agentService.abort(this.state.sessionId);
     }
     this.setState({ isRunning: false });
   };
 
-  private handleClear = async () => {
+  private readonly handleClear = async () => {
     if (this.state.sessionId) {
       await this.agentService.clearSession(this.state.sessionId);
     }
     this.setState({ messages: [], streamingText: '', error: null });
   };
 
-  /** Gather sketch context from the workspace. Simplified for now. */
+  /**
+   * Build AgentContext from live IDE state.
+   * Board + port come from BoardsServiceProvider.
+   * Sketch path comes from SketchesServiceClientImpl.
+   * Serial buffer comes from MonitorModel.
+   * Actual sketch code is read server-side from the path.
+   */
   private async buildContext(): Promise<AgentContext> {
-    // These will be wired to BoardsServiceProvider + SketchesService in a follow-up
+    // Board + port
+    const { selectedBoard, selectedPort } = this.boardsServiceProvider.boardsConfig;
+
+    // Sketch path
+    let sketchPath = '';
+    try {
+      const currentSketch = await this.sketchesClient.currentSketch();
+      // CurrentSketch is Sketch | 'invalid'
+      if (currentSketch !== 'invalid' && typeof currentSketch === 'object') {
+        const uri: string = currentSketch.uri;
+        sketchPath = uri.startsWith('file://') ? decodeURIComponent(uri.slice(7)) : uri;
+      }
+    } catch {
+      // Not critical — agent will prompt user
+    }
+
+    // Serial buffer from MonitorModel (last 200 lines)
+    const serialBuffer = this.getSerialBuffer();
+
     return {
-      sketchCode: '// (context injection coming soon)',
-      sketchPath: '',
-      boardFqbn: '',
-      boardName: '',
-      port: '',
+      sketchCode: '', // filled server-side from sketchPath
+      sketchPath,
+      boardFqbn: selectedBoard?.fqbn ?? '',
+      boardName: selectedBoard?.name ?? '',
+      port: selectedPort?.address ?? '',
       lastBuildOutput: '',
       lastBuildErrors: '',
-      serialBuffer: '',
+      serialBuffer,
     };
+  }
+
+  private getSerialBuffer(): string {
+    // MonitorModel stores messages — extract last 200 lines of text
+    try {
+      const state = (this.monitorModel as unknown as { messages?: Array<{ message: string }> });
+      if (state.messages) {
+        return state.messages
+          .slice(-200)
+          .map((m) => m.message)
+          .join('');
+      }
+    } catch {
+      // fallback
+    }
+    return '';
   }
 
   // ── Rendering ─────────────────────────────────────────────────────────────
 
-  protected onActivateRequest(msg: Message): void {
+  protected override onActivateRequest(msg: Message): void {
     super.onActivateRequest(msg);
     this.update();
   }
 
   protected render(): React.ReactNode {
-    const { messages, input, isRunning, streamingText, activeToolName, error } = this.state;
+    const { messages, input, isRunning, streamingText, activeToolName, error } =
+      this.state;
+
+    const { selectedBoard, selectedPort } = this.boardsServiceProvider.boardsConfig;
+    const boardLabel = selectedBoard?.name ?? null;
+    const portLabel = selectedPort?.address ?? null;
 
     return (
       <div className="agent-panel">
@@ -207,18 +272,31 @@ export class AgentPanelWidget extends ReactWidget implements AgentServiceClient 
           </div>
         </div>
 
+        {/* Board + Port status bar */}
+        <div className="agent-panel__context-bar">
+          <span className={`agent-ctx-badge ${boardLabel ? '' : 'agent-ctx-badge--warn'}`}>
+            <span className="codicon codicon-circuit-board" />
+            {' '}{boardLabel ?? 'No board selected'}
+          </span>
+          <span className={`agent-ctx-badge ${portLabel ? '' : 'agent-ctx-badge--warn'}`}>
+            <span className="codicon codicon-plug" />
+            {' '}{portLabel ?? 'No port'}
+          </span>
+        </div>
+
         {/* Messages */}
-        <div className="agent-panel__messages" ref={this.scrollRef}>
+        <div className="agent-panel__messages" ref={this.scrollToBottom}>
           {messages.length === 0 && !isRunning && (
             <div className="agent-panel__welcome">
               <div className="agent-welcome__icon">🤖</div>
               <div className="agent-welcome__title">ArduinoIDE Agent</div>
               <div className="agent-welcome__subtitle">
-                I can write code, compile, upload, and debug your Arduino projects autonomously.
+                Plug in your board, select it from the toolbar, then describe what you want to build.
+                I'll write the code, compile it, flash it, and verify it works.
               </div>
               <div className="agent-welcome__examples">
-                <div className="agent-welcome__example-label">Try:</div>
-                {this.examplePrompts.map((p, i) => (
+                <div className="agent-welcome__example-label">Try asking:</div>
+                {EXAMPLE_PROMPTS.map((p, i) => (
                   <button
                     key={i}
                     className="agent-welcome__chip"
@@ -248,7 +326,9 @@ export class AgentPanelWidget extends ReactWidget implements AgentServiceClient 
           {activeToolName && (
             <div className="agent-tool-call">
               <span className="agent-tool-call__spinner" />
-              <span className="agent-tool-call__name">Running: <code>{activeToolName}</code></span>
+              <span className="agent-tool-call__name">
+                Running: <code>{activeToolName}</code>
+              </span>
             </div>
           )}
 
@@ -267,12 +347,16 @@ export class AgentPanelWidget extends ReactWidget implements AgentServiceClient 
             value={input}
             onChange={this.handleInputChange}
             onKeyDown={this.handleKeyDown}
-            placeholder={isRunning ? 'Agent is working...' : 'Ask the agent... (Enter to send, Shift+Enter for newline)'}
+            placeholder={
+              isRunning
+                ? 'Agent is working...'
+                : 'Describe what you want to build... (Enter to send, Shift+Enter for newline)'
+            }
             disabled={isRunning}
             rows={3}
           />
           <button
-            className={`agent-btn agent-btn--send ${isRunning ? 'agent-btn--disabled' : ''}`}
+            className={`agent-btn agent-btn--send${isRunning || !input.trim() ? ' agent-btn--disabled' : ''}`}
             onClick={this.sendMessage}
             disabled={isRunning || !input.trim()}
             title="Send (Enter)"
@@ -284,14 +368,7 @@ export class AgentPanelWidget extends ReactWidget implements AgentServiceClient 
     );
   }
 
-  private readonly examplePrompts = [
-    'Blink LED on pin 13 every 500ms',
-    'Read temperature from DHT22 on pin 2 and print to serial',
-    'Configure SPI at 4MHz and write 0x42 to register 0x10',
-    'Fix all compile errors in my sketch',
-  ];
-
-  private scrollRef = (el: HTMLDivElement | null) => {
+  private readonly scrollToBottom = (el: HTMLDivElement | null) => {
     if (el) {
       el.scrollTop = el.scrollHeight;
     }
@@ -301,9 +378,18 @@ export class AgentPanelWidget extends ReactWidget implements AgentServiceClient 
     if (msg.role === 'tool') {
       return (
         <div key={msg.id} className="agent-tool-result">
-          <div className={`agent-tool-result__header ${msg.toolStatus === 'error' ? 'agent-tool-result--error' : ''}`}>
-            <span className={`codicon ${msg.toolStatus === 'error' ? 'codicon-error' : 'codicon-check'}`} />
-            {' '}<code>{msg.toolName}</code>
+          <div
+            className={`agent-tool-result__header${
+              msg.toolStatus === 'error' ? ' agent-tool-result--error' : ''
+            }`}
+          >
+            <span
+              className={`codicon ${
+                msg.toolStatus === 'error' ? 'codicon-error' : 'codicon-check'
+              }`}
+            />
+            {' '}
+            <code>{msg.toolName}</code>
           </div>
           <pre className="agent-tool-result__output">{msg.content}</pre>
         </div>
@@ -311,10 +397,7 @@ export class AgentPanelWidget extends ReactWidget implements AgentServiceClient 
     }
 
     return (
-      <div
-        key={msg.id}
-        className={`agent-message agent-message--${msg.role}`}
-      >
+      <div key={msg.id} className={`agent-message agent-message--${msg.role}`}>
         <div className="agent-message__avatar">
           {msg.role === 'user' ? 'You' : 'AI'}
         </div>
@@ -328,3 +411,11 @@ export class AgentPanelWidget extends ReactWidget implements AgentServiceClient 
     );
   }
 }
+
+const EXAMPLE_PROMPTS = [
+  'Blink the built-in LED every 500ms',
+  'Read temperature from DHT22 on pin 2 and print to serial every second',
+  'Configure SPI and toggle CS pin every 100ms',
+  'Fix all compile errors in my sketch',
+  'What board should I use for a WiFi project?',
+];

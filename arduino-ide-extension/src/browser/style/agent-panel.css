@@ -21,6 +21,35 @@
   overflow: hidden;
 }
 
+/* ── Context bar (board + port status) ──────────────────── */
+.agent-panel__context-bar {
+  display: flex;
+  gap: 6px;
+  padding: 4px 10px;
+  background: var(--theia-sideBar-background);
+  border-bottom: 1px solid var(--theia-panel-border);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.agent-ctx-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  background: #1e3a2f;
+  color: #4ec9a0;
+  border: 1px solid #2d5a44;
+}
+
+.agent-ctx-badge--warn {
+  background: #3a2a1e;
+  color: #e5a84e;
+  border-color: #5a4a2d;
+}
+
 /* ── Header ──────────────────────────────────────────────── */
 .agent-panel__header {
   display: flex;

@@ -9,7 +9,9 @@
 
 import { injectable, inject, postConstruct } from '@theia/core/shared/inversify';
 import { ILogger } from '@theia/core/lib/common/logger';
-import { v4 as uuidv4 } from 'uuid';
+import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
 import {
   AgentService,
   AgentServiceClient,
@@ -19,10 +21,12 @@ import {
 } from '../../common/protocol/agent-service';
 import { ClaudeClient, ClaudeMessage } from './claude-client';
 import { AgentToolRegistry } from './agent-tools';
-import { CoreServiceImpl } from '../core-service-impl';
-import { MonitorManagerProxyImpl } from '../monitor-manager-proxy-impl';
 
 const MAX_ITERATIONS = 12;
+
+function uid(): string {
+  return crypto.randomUUID();
+}
 
 @injectable()
 export class AgentServiceImpl implements AgentService {
@@ -35,22 +39,18 @@ export class AgentServiceImpl implements AgentService {
   @inject(AgentToolRegistry)
   private readonly toolRegistry: AgentToolRegistry;
 
-  @inject(CoreServiceImpl)
-  private readonly coreService: CoreServiceImpl;
-
-  @inject(MonitorManagerProxyImpl)
-  private readonly monitorProxy: MonitorManagerProxyImpl;
-
   /** Frontend notification client — set by RPC connection handler */
   private client: AgentServiceClient | undefined;
 
-  private sessions: Map<string, AgentSession> = new Map();
-  private abortFlags: Map<string, boolean> = new Map();
+  private readonly sessions: Map<string, AgentSession> = new Map();
+  private readonly abortFlags: Map<string, boolean> = new Map();
 
   @postConstruct()
   init(): void {
-    this.toolRegistry.registerBuiltins(this.coreService, this.monitorProxy);
-    this.logger.info('[AgentService] Initialized with tools:', this.toolRegistry.getAll().map((t) => t.name));
+    this.logger.info(
+      '[AgentService] Initialized with tools:',
+      this.toolRegistry.getAll().map((t) => t.name)
+    );
   }
 
   setClient(client: AgentServiceClient | undefined): void {
@@ -58,7 +58,7 @@ export class AgentServiceImpl implements AgentService {
   }
 
   async createSession(): Promise<string> {
-    const sessionId = uuidv4();
+    const sessionId = uid();
     this.sessions.set(sessionId, {
       sessionId,
       messages: [],
@@ -89,31 +89,32 @@ export class AgentServiceImpl implements AgentService {
     }
   }
 
-  async chat(sessionId: string, userMessage: string, context: AgentContext): Promise<void> {
+  async chat(
+    sessionId: string,
+    userMessage: string,
+    context: AgentContext
+  ): Promise<void> {
     let session = this.sessions.get(sessionId);
     if (!session) {
-      session = {
-        sessionId,
-        messages: [],
-        isRunning: false,
-        iterationCount: 0,
-      };
+      session = { sessionId, messages: [], isRunning: false, iterationCount: 0 };
       this.sessions.set(sessionId, session);
     }
 
     if (session.isRunning) {
-      this.logger.warn('[AgentService] Session already running, ignoring new message.');
+      this.logger.warn('[AgentService] Session already running, ignoring message.');
       return;
     }
 
-    // Reset abort flag
     this.abortFlags.set(sessionId, false);
     session.isRunning = true;
     session.iterationCount = 0;
 
-    // Add user message to history
+    // Enrich context: read sketch code from disk if path provided
+    const enrichedContext = this.enrichContext(context);
+
+    // Add user message
     const userMsg: AgentMessage = {
-      id: uuidv4(),
+      id: uid(),
       role: 'user',
       content: userMessage,
       timestamp: new Date().toISOString(),
@@ -121,12 +122,12 @@ export class AgentServiceImpl implements AgentService {
     session.messages.push(userMsg);
     this.client?.onMessage(sessionId, userMsg);
 
-    // Build conversation history for Claude
+    // Build conversation history for Claude (user/assistant only)
     const history: ClaudeMessage[] = session.messages
       .filter((m) => m.role === 'user' || m.role === 'assistant')
       .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
 
-    const systemPrompt = this.buildSystemPrompt(context);
+    const systemPrompt = this.buildSystemPrompt(enrichedContext);
     const tools = this.toolRegistry.toClaudeTools();
 
     // ── Agentic loop ─────────────────────────────────────────────────────────
@@ -152,41 +153,47 @@ export class AgentServiceImpl implements AgentService {
         );
 
         if (response.type === 'tool_use' && response.toolCalls?.length) {
-          // Handle each tool call
           for (const toolCall of response.toolCalls) {
-            this.client?.onToolStart(sessionId, toolCall.name, toolCall.input as Record<string, unknown>);
+            this.client?.onToolStart(
+              sessionId,
+              toolCall.name,
+              toolCall.input as Record<string, unknown>
+            );
 
             const result = await this.toolRegistry.execute(
               toolCall.name,
               toolCall.input as Record<string, unknown>,
-              context
+              enrichedContext
             );
 
             this.client?.onToolEnd(sessionId, toolCall.name, result.output, result.success);
 
-            // Add tool result to history so Claude can continue
-            const toolMsg = `Tool [${toolCall.name}] result:\n${result.output}`;
+            // Append tool result to history
+            const toolMsg = `Tool [${toolCall.name}] ${result.success ? 'result' : 'ERROR'}:\n${result.output}`;
             history.push({ role: 'user', content: toolMsg });
 
-            const toolResultMsg: AgentMessage = {
-              id: uuidv4(),
+            session.messages.push({
+              id: uid(),
               role: 'tool',
               content: result.output,
               timestamp: new Date().toISOString(),
               toolName: toolCall.name,
               toolStatus: result.success ? 'success' : 'error',
-            };
-            session.messages.push(toolResultMsg);
+            });
+
+            // After write_file, refresh sketch code in context
+            if (toolCall.name === 'write_file') {
+              enrichedContext.sketchCode = this.readSketchCode(enrichedContext.sketchPath);
+            }
           }
-          // Continue loop — Claude will respond to tool results
-          continue;
+          continue; // Let Claude respond to tool results
         }
 
         // Final text response
         const assistantText = response.text || streamedText;
         if (assistantText) {
           const assistantMsg: AgentMessage = {
-            id: uuidv4(),
+            id: uid(),
             role: 'assistant',
             content: assistantText,
             timestamp: new Date().toISOString(),
@@ -195,13 +202,14 @@ export class AgentServiceImpl implements AgentService {
           this.client?.onMessage(sessionId, assistantMsg);
           history.push({ role: 'assistant', content: assistantText });
         }
-
-        // Done
         break;
       }
 
       if (session.iterationCount >= MAX_ITERATIONS) {
-        this.client?.onError(sessionId, `Reached maximum iterations (${MAX_ITERATIONS}). Please review and continue manually.`);
+        this.client?.onError(
+          sessionId,
+          `Reached maximum iterations (${MAX_ITERATIONS}). Review progress and continue manually if needed.`
+        );
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -213,40 +221,82 @@ export class AgentServiceImpl implements AgentService {
     }
   }
 
+  // ─── Context enrichment ───────────────────────────────────────────────────
+
+  private enrichContext(context: AgentContext): AgentContext {
+    const enriched = { ...context };
+    // Read sketch code from disk (frontend only passes the path)
+    if (enriched.sketchPath && !enriched.sketchCode) {
+      enriched.sketchCode = this.readSketchCode(enriched.sketchPath);
+    }
+    return enriched;
+  }
+
+  private readSketchCode(sketchPath: string): string {
+    if (!sketchPath) return '';
+    try {
+      // Find the .ino file in the sketch directory
+      const sketchName = path.basename(sketchPath);
+      const inoPath = path.join(sketchPath, `${sketchName}.ino`);
+      if (fs.existsSync(inoPath)) {
+        return fs.readFileSync(inoPath, 'utf-8');
+      }
+      // Fallback: read first .ino file
+      const files = fs.readdirSync(sketchPath).filter((f) => f.endsWith('.ino'));
+      if (files.length > 0) {
+        return fs.readFileSync(path.join(sketchPath, files[0]), 'utf-8');
+      }
+    } catch {
+      // ignore read errors
+    }
+    return '';
+  }
+
   // ─── System Prompt ─────────────────────────────────────────────────────────
 
   private buildSystemPrompt(ctx: AgentContext): string {
-    return `You are an expert embedded systems and Arduino engineer. You are operating inside ArduinoIDE Agent — an agentic IDE that gives you full control to compile, flash, and monitor real hardware.
+    const boardInfo = ctx.boardName
+      ? `${ctx.boardName} (FQBN: ${ctx.boardFqbn})`
+      : ctx.boardFqbn || 'not selected';
 
-## Hardware Context
-- **Board:** ${ctx.boardName || 'Unknown'} (FQBN: ${ctx.boardFqbn || 'not selected'})
-- **Port:** ${ctx.port || 'not connected'}
+    return `You are an expert embedded systems and Arduino engineer working inside ArduinoIDE Agent — an agentic IDE with full control to compile, flash, and monitor real hardware.
 
-## Current Sketch
+## Current Hardware Setup
+- **Board:** ${boardInfo}
+- **Port:** ${ctx.port || 'not connected — ask user to plug in board'}
+
+## Current Sketch (${ctx.sketchPath ? path.basename(ctx.sketchPath) : 'none open'})
 \`\`\`cpp
-${ctx.sketchCode || '// (empty sketch)'}
+${ctx.sketchCode || '// No sketch code yet'}
 \`\`\`
-**Sketch path:** ${ctx.sketchPath}
+${ctx.sketchPath ? `Path: ${ctx.sketchPath}` : ''}
 
-## Last Build Output
-${ctx.lastBuildOutput ? `\`\`\`\n${ctx.lastBuildOutput}\n\`\`\`` : '(no build yet)'}
+## Last Build
+${ctx.lastBuildErrors ? `**Errors:**\n\`\`\`\n${ctx.lastBuildErrors}\n\`\`\`` : ctx.lastBuildOutput ? `**Output:**\n\`\`\`\n${ctx.lastBuildOutput}\n\`\`\`` : '(no build yet)'}
 
-## Last Build Errors
-${ctx.lastBuildErrors ? `\`\`\`\n${ctx.lastBuildErrors}\n\`\`\`` : '(no errors)'}
-
-## Recent Serial Output
+## Serial Monitor
 \`\`\`
-${ctx.serialBuffer || '(no serial data)'}
+${ctx.serialBuffer || '(no serial data yet)'}
 \`\`\`
 
-## Your Capabilities
-You have tools to: read/write sketch files, compile, upload to board, read serial output, and suggest libraries.
+## Your Mission
+Work autonomously to help the user. When given a task:
+1. Write the code using \`write_file\`
+2. Compile it using \`compile\` — fix any errors
+3. Upload using \`upload\` once it compiles
+4. Check output using \`read_serial\`
+5. Iterate until the task is complete
 
-## Agentic Mode
-Work autonomously: analyze the task → write code → compile → fix errors → upload → verify via serial output → repeat.
-Keep the user informed of each step. Always write complete, correct Arduino C++ code.
-Prefer minimal, focused changes. Never delete working code unless replacing it with a better version.
+## Rules
+- Always write complete, valid Arduino C++ code
+- Never leave out essential includes, setup(), or loop()
+- When the board or port is not set, tell the user clearly and guide them to select it
+- Keep code minimal and focused on the task
+- If compilation fails, fix the exact error shown — don't guess
+- When the task is done, confirm what was achieved
 
-When you call a tool, respond ONLY with the tool call JSON. After getting the tool result, continue with your next action or final explanation.`;
+## Tool Call Format
+When calling a tool, respond ONLY with valid JSON (no markdown, no other text):
+{"tool_use": true, "name": "<tool_name>", "input": {<params>}}`;
   }
 }
