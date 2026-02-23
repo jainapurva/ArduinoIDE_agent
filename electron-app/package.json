@@ -59,7 +59,7 @@
     "target": "electron",
     "frontend": {
       "config": {
-        "applicationName": "Arduino IDE",
+        "applicationName": "ArduinoIDE Agent",
         "defaultTheme": {
           "light": "arduino-theme",
           "dark": "arduino-theme-dark"
@@ -68,7 +68,7 @@
         "validatePreferencesSchema": false,
         "electron": {
           "showWindowEarly": true,
-          "uriScheme": "arduino-ide"
+          "uriScheme": "arduinoide-agent"
         },
         "reloadOnReconnect": true,
         "preferences": {
@@ -92,7 +92,7 @@
     },
     "backend": {
       "config": {
-        "configDirName": ".arduinoIDE",
+        "configDirName": ".arduinoIDEAgent",
         "singleInstance": true
       }
     },
@@ -102,11 +102,11 @@
       }
     }
   },
-  "author": "Arduino SA",
-  "description": "Arduino IDE",
+  "author": "ArduinoIDE Agent Contributors",
+  "description": "Agentic AI-powered Arduino IDE",
   "build": {
-    "appId": "cc.arduino.IDE2",
-    "productName": "Arduino IDE",
+    "appId": "io.arduinoide.agent",
+    "productName": "ArduinoIDE Agent",
     "asar": false,
     "detectUpdateChannel": false,
     "generateUpdatesFilesForAllChannels": true,

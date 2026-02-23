@@ -121,6 +121,14 @@ import {
 import { SettingsReader } from './settings-reader';
 import { VsCodePluginScanner } from './theia/plugin-ext-vscode/scanner-vscode';
 import { rebindParcelFileSystemWatcher } from './theia/filesystem/parcel-bindings';
+import { AgentServiceImpl } from './agent/agent-service-impl';
+import { AgentToolRegistry } from './agent/agent-tools';
+import { ClaudeClient } from './agent/claude-client';
+import {
+  AgentService,
+  AgentServicePath,
+  AgentServiceClient,
+} from '../common/protocol/agent-service';
 
 export default new ContainerModule((bind, unbind, isBound, rebind) => {
   bind(BackendApplication).toSelf().inSingletonScope();
@@ -399,6 +407,25 @@ export default new ContainerModule((bind, unbind, isBound, rebind) => {
   // https://github.com/eclipse-theia/theia/issues/14309
   bind(VsCodePluginScanner).toSelf().inSingletonScope();
   rebind(PluginScanner).toService(VsCodePluginScanner);
+
+  // ── ArduinoIDE Agent — AI agentic service ────────────────────────────────
+  bind(ClaudeClient).toSelf().inSingletonScope();
+  bind(AgentToolRegistry).toSelf().inSingletonScope();
+  bind(AgentServiceImpl).toSelf().inSingletonScope();
+  bind(AgentService).toService(AgentServiceImpl);
+  bind(ConnectionHandler)
+    .toDynamicValue(
+      (context) =>
+        new JsonRpcConnectionHandler<AgentServiceClient>(
+          AgentServicePath,
+          (client) => {
+            const server = context.container.get<AgentServiceImpl>(AgentServiceImpl);
+            server.setClient(client);
+            return server;
+          }
+        )
+    )
+    .inSingletonScope();
 });
 
 function bindChildLogger(bind: interfaces.Bind, name: string): void {

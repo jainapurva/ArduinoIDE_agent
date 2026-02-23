@@ -1,4 +1,6 @@
 import '../../src/browser/style/index.css';
+import { AgentPanelWidget } from './agent/agent-panel-widget';
+import { AgentViewContribution } from './agent/agent-view-contribution';
 import { Container, ContainerModule } from '@theia/core/shared/inversify';
 import { WidgetFactory } from '@theia/core/lib/browser/widget-manager';
 import { CommandContribution } from '@theia/core/lib/common/command';
@@ -1070,4 +1072,15 @@ export default new ContainerModule((bind, unbind, isBound, rebind) => {
   // Hides the Test Explorer from the side-bar
   bind(TestViewContribution).toSelf().inSingletonScope();
   rebind(TheiaTestViewContribution).toService(TestViewContribution);
+
+  // ── ArduinoIDE Agent — AI panel ──────────────────────────────────────────
+  bindViewContribution(bind, AgentViewContribution);
+  bind(FrontendApplicationContribution).toService(AgentViewContribution);
+  bind(AgentPanelWidget).toSelf();
+  bind(WidgetFactory)
+    .toDynamicValue((ctx) => ({
+      id: AgentPanelWidget.ID,
+      createWidget: () => ctx.container.get(AgentPanelWidget),
+    }))
+    .inSingletonScope();
 });
