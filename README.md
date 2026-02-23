@@ -1,55 +1,226 @@
-<img src="https://content.arduino.cc/website/Arduino_logo_teal.svg" height="100" align="right" />
+<div align="center">
+  <img src="https://content.arduino.cc/website/Arduino_logo_teal.svg" height="80" />
+  <h1>ArduinoIDE Agent 🤖</h1>
+  <p><strong>The first fully agentic Arduino IDE — powered by Claude AI</strong></p>
+  <p>
+    <img src="https://img.shields.io/badge/version-2.3.8--agent-blue" />
+    <img src="https://img.shields.io/badge/AI-Claude%20Sonnet%204.6-purple" />
+    <img src="https://img.shields.io/badge/platform-Electron-lightblue" />
+    <img src="https://img.shields.io/badge/base-Arduino%20IDE%202.x-teal" />
+    <img src="https://img.shields.io/badge/branch-feat%2Fagentic--core-green" />
+  </p>
+</div>
 
-# Arduino IDE 2.x
+---
 
-[![Build status](https://github.com/arduino/arduino-ide/actions/workflows/build.yml/badge.svg)](https://github.com/arduino/arduino-ide/actions/workflows/build.yml)
-[![Check JavaScript status](https://github.com/arduino/arduino-ide/actions/workflows/check-javascript.yml/badge.svg)](https://github.com/arduino/arduino-ide/actions/workflows/check-javascript.yml)
-[![Test JavaScript status](https://github.com/arduino/arduino-ide/actions/workflows/test-javascript.yml/badge.svg)](https://github.com/arduino/arduino-ide/actions/workflows/test-javascript.yml)
+> **Forked from** [arduino/arduino-ide](https://github.com/arduino/arduino-ide) · Active branch: `feat/agentic-core`
 
-This repository contains the source code of the Arduino IDE 2.x. If you're looking for the old IDE, go to the [repository of the 1.x version](https://github.com/arduino/Arduino).
+ArduinoIDE Agent transforms the standard Arduino IDE into a **Cursor-style agentic development environment**. Plug in your board, describe what you want to build, and the AI agent writes the code, compiles it, flashes it to your hardware, reads the serial output, and iterates until it works — all autonomously.
 
-The Arduino IDE 2.x is a major rewrite, sharing no code with the IDE 1.x. It is based on the [Theia IDE](https://theia-ide.org/) framework and built with [Electron](https://www.electronjs.org/). The backend operations such as compilation and uploading are offloaded to an [arduino-cli](https://github.com/arduino/arduino-cli) instance running in daemon mode. This new IDE was developed with the goal of preserving the same interface and user experience of the previous major version in order to provide a frictionless upgrade.
+---
 
-![](static/screenshot.png)
+## What's New vs Arduino IDE 2.x
 
-## Download
+| Feature | Arduino IDE 2.x | ArduinoIDE Agent |
+|---|---|---|
+| AI Assistant | ❌ | ✅ Full agentic loop |
+| Auto-compile on error | ❌ | ✅ Agent iterates |
+| Auto-upload | ❌ | ✅ Agent flashes board |
+| Serial monitor feedback | Manual | ✅ Agent reads output |
+| Datasheet → Driver | ❌ | 🔜 Phase 3 |
+| Board auto-detection | Manual | ✅ Agent sees live state |
+| Code suggestions | ❌ | ✅ Full code generation |
 
-You can download the latest release version and nightly builds from the [software download page on the Arduino website](https://www.arduino.cc/en/software).
+---
 
-## Support
+## Demo Flow
 
-If you need assistance, see the [Help Center](https://support.arduino.cc/hc/en-us/categories/360002212660-Software-and-Downloads) and browse the [forum](https://forum.arduino.cc/index.php?board=150.0).
+```
+User: "Read temperature from DHT22 on pin 2 and print every second"
 
-## Bugs & Issues
+Agent:
+  1. [write_file] → writes DHT22 Arduino sketch
+  2. [compile]    → compiles for selected board
+  3. [compile]    → fixes error: "DHT.h not found" → adds library include
+  4. [upload]     → flashes to connected Arduino
+  5. [read_serial] → reads: "Temperature: 23.4°C, Humidity: 61%"
+  6. ✅ Done — confirms working
+```
 
-If you want to report an issue, you can submit it to the [issue tracker](https://github.com/arduino/arduino-ide/issues) of this repository.
+---
 
-See [**the issue report guide**](docs/contributor-guide/issues.md#issue-report-guide) for instructions.
+## Architecture
 
-### Security
+### New Agentic Layers (all new code is in `arduino-ide-extension/src/`)
 
-If you think you found a vulnerability or other security-related bug in this project, please read our
-[security policy](https://github.com/arduino/arduino-ide/security/policy) and report the bug to our Security Team 🛡️
-Thank you!
+```
+arduino-ide-extension/src/
+├── common/protocol/
+│   └── agent-service.ts              ← RPC interface (AgentService + streaming client)
+│
+├── node/agent/                        ← Backend (Node.js)
+│   ├── claude-client.ts              ← Calls claude -p CLI (no API key needed)
+│   ├── agent-tools.ts                ← Tool registry: 7 tools
+│   └── agent-service-impl.ts         ← Agentic loop orchestrator (max 12 iters)
+│
+└── browser/agent/                     ← Frontend (React/Theia)
+    ├── agent-panel-widget.tsx         ← Cursor-style chat panel
+    └── agent-view-contribution.ts     ← Sidebar registration, Ctrl+Shift+A
+```
 
-e-mail contact: security@arduino.cc
+### Agent Tools
 
-## Contributions and development
+| Tool | What it does |
+|---|---|
+| `write_file` | Write/overwrite sketch files (agent's primary code output) |
+| `read_file` | Read any file in the sketch directory |
+| `list_files` | List files in sketch folder |
+| `compile` | Run `arduino-cli compile` — returns errors for agent to fix |
+| `upload` | Compile + `arduino-cli upload` to connected board |
+| `read_serial` | Read serial monitor buffer (live board output) |
+| `suggest_library` | Recommend Arduino library for a use case |
 
-Contributions are very welcome! There are several ways to participate in this project, including:
+### Agentic Loop
 
-- Fixing bugs
-- Beta testing
-- Translation
+```
+User message
+     ↓
+Build system prompt (board FQBN + port + sketch code + serial buffer)
+     ↓
+Claude (claude -p CLI, no API key)
+     ↓
+  ┌──────────────────────────────┐
+  │ tool_use? → execute tool    │
+  │   → append result to history │
+  │   → loop (max 12 iterations)│
+  └──────────────────────────────┘
+     ↓
+Final response → stream to UI
+```
 
-See [**the contributor guide**](docs/CONTRIBUTING.md#contributor-guide) for more information.
+### Live IDE Context (Plug & Play)
 
-See the [**development guide**](docs/development.md) for a technical overview of the application and instructions for building the code.
+The agent always knows:
+- **Board FQBN** — from `BoardsServiceProvider` (whatever you selected in toolbar)
+- **Port** — from `BoardsServiceProvider` (auto-updates when you plug in USB)
+- **Sketch path** — from `SketchesServiceClientImpl`
+- **Sketch code** — read server-side from disk
+- **Serial output** — from `MonitorModel` (last 200 lines)
 
-### Support the project
+---
 
-This open source code was written by the Arduino team and is maintained on a daily basis with the help of the community. We invest a considerable amount of time in development, testing and optimization. Please consider [buying original Arduino boards](https://store.arduino.cc/) to support our work on the project.
+## Getting Started
 
-## License
+### Prerequisites
+- Node.js 18–20
+- Yarn 1.x
+- Claude Code subscription (for `claude -p` CLI)
 
-The code contained in this repository and the executable distributions are licensed under the terms of the GNU AGPLv3. The executable distributions contain third-party code licensed under other compatible licenses such as GPLv2, MIT and BSD-3. If you have questions about licensing please contact us at [license@arduino.cc](mailto:license@arduino.cc).
+### Build from Source
+
+```bash
+git clone https://github.com/jainapurva/ArduinoIDE_agent.git
+cd ArduinoIDE_agent
+git checkout feat/agentic-core
+
+# Install dependencies
+yarn install
+
+# Build
+yarn build
+
+# Run
+yarn start
+```
+
+> **Note:** First build downloads Arduino CLI and language server tools (~5 min).
+
+### Using the Agent
+
+1. Open ArduinoIDE Agent
+2. Plug in your Arduino/ESP32/board via USB
+3. Select board from the **toolbar dropdown** (e.g. "Arduino Uno")
+4. Select port (auto-detected, shown in toolbar)
+5. Press **Ctrl+Shift+A** to open the AI Agent panel (or it opens automatically)
+6. Type what you want to build → press Enter
+7. Watch the agent write, compile, flash, and verify 🚀
+
+---
+
+## Project Structure
+
+```
+ArduinoIDE_agent/
+├── arduino-ide-extension/        ← Main extension (all agent code here)
+│   ├── src/
+│   │   ├── browser/              ← Frontend (React + Theia widgets)
+│   │   │   ├── agent/            ← 🆕 Agent panel widget + view contribution
+│   │   │   └── style/            ← CSS (agent-panel.css added)
+│   │   ├── node/                 ← Backend (Node.js services)
+│   │   │   └── agent/            ← 🆕 ClaudeClient + AgentService + Tools
+│   │   └── common/protocol/      ← Shared RPC interfaces
+│   │       └── agent-service.ts  ← 🆕 Agent protocol definition
+│   └── package.json
+├── electron-app/                 ← Electron shell (rebranded)
+├── CLAUDE.md                     ← 🆕 Project memory + architecture docs
+└── README.md                     ← This file
+```
+
+---
+
+## Roadmap
+
+### ✅ Phase 1 — Core Agent (Done)
+- Forked from arduino/arduino-ide
+- Rebranded to ArduinoIDE Agent
+- AgentService RPC protocol
+- ClaudeClient (claude -p, no API key)
+- 7 agent tools (compile, upload, serial, file I/O, library suggest)
+- Multi-turn agentic loop (12 iterations max, user abort)
+- Cursor-style chat panel with streaming
+- Live board/port/sketch context wiring
+- Zero TypeScript errors in all new files
+
+### 🔜 Phase 2 — HIL Loop
+- Hardware-in-the-loop continuous monitoring mode
+- ARM Cortex-M HardFault decoder (parse CFSR/HFSR from serial)
+- FreeRTOS deadlock detector
+- Last build errors/output injected into context
+
+### 🔜 Phase 3 — Datasheet Intelligence
+- PDF upload → extract register maps → generate C/Rust drivers
+- MCU-specific agent "packs" (STM32, ESP32, nRF52, RP2040)
+- Peripheral configuration agent (SPI/I2C/UART from natural language)
+
+### 🔜 Phase 4 — Polish & Distribution
+- Diff view for AI-proposed code changes (Accept/Reject)
+- Agent mode status bar indicator
+- Package as .deb / .AppImage / .dmg / .exe
+- Monetization hooks (usage tracking, free/pro tiers)
+
+---
+
+## Key Design Decisions
+
+| Decision | Rationale |
+|---|---|
+| `claude -p` CLI (no API key) | Uses existing Claude Code subscription — zero setup for users |
+| subprocess for compile/upload | Avoids gRPC DI complexity; works standalone with bundled arduino-cli |
+| Max 12 iterations | Prevents infinite loops; user can abort or continue manually |
+| Context built frontend-side | Frontend has live access to BoardsServiceProvider + SketchesService |
+| Sketch code read server-side | Backend reads .ino from disk — no large payloads over RPC |
+
+---
+
+## Based On
+
+- [Arduino IDE 2.x](https://github.com/arduino/arduino-ide) — AGPL-3.0
+- [Theia IDE](https://theia-ide.org/) — EPL-2.0
+- [Arduino CLI](https://github.com/arduino/arduino-cli) — GPL-3.0
+- [Claude](https://claude.ai) by Anthropic
+
+---
+
+<div align="center">
+  <sub>Built with ❤️ on top of Arduino IDE 2.x · Branch: <code>feat/agentic-core</code></sub>
+</div>
