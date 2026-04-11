@@ -413,9 +413,9 @@ export class AgentPanelWidget extends ReactWidget implements AgentServiceClient 
 }
 
 const EXAMPLE_PROMPTS = [
-  'Blink the built-in LED every 500ms',
-  'Read temperature from DHT22 on pin 2 and print to serial every second',
-  'Configure SPI and toggle CS pin every 100ms',
-  'Fix all compile errors in my sketch',
-  'What board should I use for a WiFi project?',
+  'Build me a temperature and humidity monitor with a display',
+  'I want a motion-activated alarm system',
+  'Create a WiFi weather station that logs to serial',
+  'Build a servo-controlled door lock with a button',
+  'I want to control NeoPixel LEDs with a potentiometer',
 ];

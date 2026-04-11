@@ -12,6 +12,11 @@ import * as path from 'path';
 import { ClaudeTool } from './claude-client';
 import { AgentContext } from '../../common/protocol/agent-service';
 import { arduinoCliPath } from '../resources';
+import { makeDesignTool } from './tools/design-tool';
+import { makeValidateTool } from './tools/validate-tool';
+import { makeWiringTool } from './tools/wiring-tool';
+import { makeCameraTool } from './tools/camera-tool';
+import { makeVerifyTool } from './tools/verify-tool';
 
 export interface ToolResult {
   success: boolean;
@@ -42,6 +47,11 @@ export class AgentToolRegistry {
     this.register(makeUploadTool());
     this.register(makeReadSerialTool());
     this.register(makeSuggestLibraryTool());
+    this.register(makeDesignTool());
+    this.register(makeValidateTool());
+    this.register(makeWiringTool());
+    this.register(makeCameraTool());
+    this.register(makeVerifyTool());
   }
 
   register(tool: AgentTool): void {
