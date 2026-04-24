@@ -178,6 +178,9 @@ export class ElectronMainApplication extends TheiaElectronMainApplication {
   private readonly scheduledDeletions: Disposable[] = [];
 
   override async start(config: FrontendApplicationConfig): Promise<void> {
+    // Suppress EPIPE errors on stdout/stderr (Electron pipe may close before writes complete)
+    process.stdout.on('error', (err: NodeJS.ErrnoException) => { if (err.code !== 'EPIPE') throw err; });
+    process.stderr.on('error', (err: NodeJS.ErrnoException) => { if (err.code !== 'EPIPE') throw err; });
     createYargs(this.argv, process.cwd())
       .command(
         '$0 [file]',
