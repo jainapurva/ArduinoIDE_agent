@@ -84,42 +84,18 @@ export class ClaudeClient {
         { env, stdio: ['pipe', 'pipe', 'pipe'] }
       );
 
-      let fullText = '';
       let resultText = '';
       let buffer = '';
 
+      // We DON'T stream tokens during reception — we wait for the full result.
+      // This prevents raw tool-call JSON from being shown to the user.
+      // The trade-off is no real-time streaming, but correct tool call handling.
+
       proc.stdout.on('data', (data: Buffer) => {
         buffer += data.toString();
-
-        // Process complete lines from buffer
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || ''; // Keep incomplete last line in buffer
-
-        for (const line of lines) {
-          const trimmedLine = line.trim();
-          if (!trimmedLine) continue;
-          try {
-            const parsed = JSON.parse(trimmedLine);
-            if (parsed.type === 'assistant' && parsed.message?.content) {
-              for (const block of parsed.message.content) {
-                if (block.type === 'text' && block.text) {
-                  onToken(block.text);
-                  fullText += block.text;
-                }
-                // Skip 'thinking' blocks — don't stream those
-              }
-            } else if (parsed.type === 'result' && parsed.result) {
-              resultText = parsed.result;
-            }
-            // Skip system, rate_limit_event, and other metadata lines
-          } catch {
-            // Not valid JSON — ignore (don't append to fullText)
-          }
-        }
       });
 
       proc.stderr.on('data', (data: Buffer) => {
-        // Ignore stderr (debug logs from claude CLI)
         const msg = data.toString();
         if (msg.includes('Error') || msg.includes('error')) {
           console.error('[ClaudeClient] stderr:', msg);
@@ -127,18 +103,31 @@ export class ClaudeClient {
       });
 
       proc.on('close', (code) => {
-        // Use resultText (from stream-json 'result' event) as authoritative, fallback to accumulated text
-        const finalText = resultText || fullText;
+        // Parse all buffered stream-json lines to extract the result
+        const lines = buffer.split('\n');
+        for (const line of lines) {
+          const trimmedLine = line.trim();
+          if (!trimmedLine) continue;
+          try {
+            const parsed = JSON.parse(trimmedLine);
+            if (parsed.type === 'result' && parsed.result) {
+              resultText = parsed.result;
+            }
+          } catch {
+            // Not valid JSON line — skip
+          }
+        }
 
-        if (code !== 0 && !finalText) {
+        if (code !== 0 && !resultText) {
           reject(new Error(`Claude CLI exited with code ${code}`));
           return;
         }
 
+        const finalText = resultText.trim();
+
         // Detect tool call in response
-        const trimmed = finalText.trim();
         try {
-          const json = JSON.parse(trimmed);
+          const json = JSON.parse(finalText);
           if (json.tool_use === true && json.name) {
             resolve({
               type: 'tool_use',
@@ -155,7 +144,12 @@ export class ClaudeClient {
             return;
           }
         } catch {
-          // Not a tool call JSON
+          // Not a tool call JSON — it's a text response
+        }
+
+        // Stream the final text to the UI now that we know it's not a tool call
+        if (finalText) {
+          onToken(finalText);
         }
 
         resolve({
