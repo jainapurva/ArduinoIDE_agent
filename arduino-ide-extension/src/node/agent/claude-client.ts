@@ -80,7 +80,7 @@ export class ClaudeClient {
 
       const proc = spawn(
         this.claudePath,
-        ['-p', '--output-format', 'stream-json', '--model', 'claude-sonnet-4-6', fullPrompt],
+        ['-p', '--output-format', 'stream-json', '--verbose', '--model', 'claude-sonnet-4-6', fullPrompt],
         { env, stdio: ['pipe', 'pipe', 'pipe'] }
       );
 
