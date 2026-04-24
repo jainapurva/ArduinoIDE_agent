@@ -85,31 +85,35 @@ export class ClaudeClient {
       );
 
       let fullText = '';
-      let rawOutput = '';
+      let resultText = '';
+      let buffer = '';
 
       proc.stdout.on('data', (data: Buffer) => {
-        const chunk = data.toString();
-        rawOutput += chunk;
+        buffer += data.toString();
 
-        // Parse stream-json lines
-        const lines = chunk.split('\n').filter((l) => l.trim());
+        // Process complete lines from buffer
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; // Keep incomplete last line in buffer
+
         for (const line of lines) {
+          const trimmedLine = line.trim();
+          if (!trimmedLine) continue;
           try {
-            const parsed = JSON.parse(line);
+            const parsed = JSON.parse(trimmedLine);
             if (parsed.type === 'assistant' && parsed.message?.content) {
               for (const block of parsed.message.content) {
-                if (block.type === 'text') {
-                  onToken(block.text || '');
-                  fullText += block.text || '';
+                if (block.type === 'text' && block.text) {
+                  onToken(block.text);
+                  fullText += block.text;
                 }
+                // Skip 'thinking' blocks — don't stream those
               }
-            } else if (parsed.type === 'result') {
-              fullText = parsed.result || fullText;
+            } else if (parsed.type === 'result' && parsed.result) {
+              resultText = parsed.result;
             }
+            // Skip system, rate_limit_event, and other metadata lines
           } catch {
-            // Non-JSON line, likely a token
-            onToken(chunk);
-            fullText += chunk;
+            // Not valid JSON — ignore (don't append to fullText)
           }
         }
       });
@@ -123,13 +127,16 @@ export class ClaudeClient {
       });
 
       proc.on('close', (code) => {
-        if (code !== 0 && !fullText) {
+        // Use resultText (from stream-json 'result' event) as authoritative, fallback to accumulated text
+        const finalText = resultText || fullText;
+
+        if (code !== 0 && !finalText) {
           reject(new Error(`Claude CLI exited with code ${code}`));
           return;
         }
 
         // Detect tool call in response
-        const trimmed = fullText.trim();
+        const trimmed = finalText.trim();
         try {
           const json = JSON.parse(trimmed);
           if (json.tool_use === true && json.name) {
@@ -153,7 +160,7 @@ export class ClaudeClient {
 
         resolve({
           type: 'text',
-          text: fullText,
+          text: finalText,
           stopReason: 'end_turn',
         });
       });
