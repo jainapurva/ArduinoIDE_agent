@@ -94,6 +94,17 @@ export class ApplicationShell extends TheiaApplicationShell {
     return topPanel;
   }
 
+  /**
+   * Chat-first layout: collapse sidebars and bottom panel on startup.
+   * The agent panel in the main area is the primary view.
+   * User can open code editor on demand.
+   */
+  collapseSecondaryPanels(): void {
+    this.leftPanelHandler.collapse();
+    this.rightPanelHandler.collapse();
+    this.collapseBottomPanel();
+  }
+
   override async saveAll(options?: SaveOptions): Promise<void> {
     // When there is no connection between the IDE2 frontend and backend.
     if (this.connectionStatusService.offlineStatus === 'backend') {

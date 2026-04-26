@@ -8,10 +8,13 @@
   display: flex;
   flex-direction: column;
   height: 100%;
+  width: 100%;
   background-color: var(--theia-editor-background);
   color: var(--theia-foreground);
   font-family: var(--theia-ui-font-family);
-  min-width: 300px;
+  min-width: 0; /* Allow shrinking in main area */
+  max-width: 900px; /* Keep chat readable — centered */
+  margin: 0 auto; /* Center the chat panel */
 }
 
 .agent-panel {

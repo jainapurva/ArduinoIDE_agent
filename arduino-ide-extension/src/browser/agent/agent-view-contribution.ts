@@ -1,17 +1,20 @@
 /**
- * AgentViewContribution — Registers the AI Agent panel in the Theia shell.
- * Opens it on the right side, accessible via Ctrl+Shift+A and the View menu.
+ * AgentViewContribution — Registers the AI Agent panel as the MAIN view.
+ * Chat-first UI: the agent panel takes center stage.
+ * Code editor opens on-demand when user clicks a file name.
  */
 
 import { injectable } from '@theia/core/shared/inversify';
 import {
   AbstractViewContribution,
   FrontendApplicationContribution,
+  FrontendApplication,
   KeybindingRegistry,
 } from '@theia/core/lib/browser';
 import { Command, CommandRegistry, MenuModelRegistry } from '@theia/core';
 import { AgentPanelWidget } from './agent-panel-widget';
 import { ArduinoMenus } from '../menu/arduino-menus';
+import { ApplicationShell } from '../theia/core/application-shell';
 
 export namespace AgentCommands {
   export const TOGGLE_AGENT_PANEL: Command = {
@@ -37,16 +40,22 @@ export class AgentViewContribution
       widgetId: AgentPanelWidget.ID,
       widgetName: AgentPanelWidget.LABEL,
       defaultWidgetOptions: {
-        area: 'right',
-        rank: 100,
+        area: 'main',  // CENTER — not sidebar. This is the primary view.
       },
       toggleCommandId: AgentCommands.TOGGLE_AGENT_PANEL.id,
     });
   }
 
-  async initializeLayout(): Promise<void> {
-    // Auto-open on first launch
-    await this.openView({ activate: false, reveal: false });
+  async initializeLayout(app: FrontendApplication): Promise<void> {
+    // Open the agent panel as the primary view on startup
+    await this.openView({ activate: true, reveal: true });
+
+    // Collapse sidebars and bottom panel — chat-first UI
+    const shell = app.shell as ApplicationShell;
+    if (shell.collapseSecondaryPanels) {
+      // Small delay to ensure layout is initialized first
+      setTimeout(() => shell.collapseSecondaryPanels(), 500);
+    }
   }
 
   override registerCommands(registry: CommandRegistry): void {
