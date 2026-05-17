@@ -47,6 +47,7 @@ export class AgentToolRegistry {
     this.register(makeUploadTool());
     this.register(makeReadSerialTool());
     this.register(makeSuggestLibraryTool());
+    this.register(makeInstallLibraryTool());
     this.register(makeDesignTool());
     this.register(makeValidateTool());
     this.register(makeWiringTool());
@@ -146,13 +147,30 @@ function makeWriteFileTool(): AgentTool {
 function makeListFilesTool(): AgentTool {
   return {
     name: 'list_files',
-    description: 'List all files in the current sketch directory.',
+    description: 'List all files in the current sketch directory with sizes and types.',
     parameters: {},
     async execute(_params, context) {
       if (!context.sketchPath || !fs.existsSync(context.sketchPath)) {
         return { success: false, output: 'No sketch directory found. Open a sketch first.' };
       }
-      return { success: true, output: fs.readdirSync(context.sketchPath).join('\n') };
+      const files = fs.readdirSync(context.sketchPath);
+      const lines = files.map((f) => {
+        try {
+          const stat = fs.statSync(path.join(context.sketchPath, f));
+          const size = stat.isDirectory() ? 'dir' : `${stat.size} bytes`;
+          const ext = path.extname(f).toLowerCase();
+          const typeMap: Record<string, string> = {
+            '.ino': 'source', '.cpp': 'source', '.c': 'source',
+            '.h': 'header', '.hpp': 'header',
+            '.S': 'assembly', '.json': 'config', '.txt': 'text',
+          };
+          const type = typeMap[ext] || '';
+          return type ? `${f} (${size}, ${type})` : `${f} (${size})`;
+        } catch {
+          return f;
+        }
+      });
+      return { success: true, output: lines.join('\n') };
     },
   };
 }
@@ -161,10 +179,18 @@ function makeCompileTool(): AgentTool {
   return {
     name: 'compile',
     description:
-      'Compile the current Arduino sketch. Returns build output, errors, and binary size.',
-    parameters: {},
-    execute(_params, context) {
-      return Promise.resolve(runCompile(context));
+      'Compile the current Arduino sketch. Returns build output, errors, and binary size. If the IDE has no board selected, you MUST pass the `fqbn` parameter (e.g. "arduino:avr:uno" for an UNO, "arduino:avr:nano" for a Nano, "esp32:esp32:esp32" for a generic ESP32) — infer it from the user request and do NOT ask them to pick a board.',
+    parameters: {
+      fqbn: {
+        type: 'string',
+        description:
+          'Optional Arduino FQBN to compile for. Overrides the IDE\'s board selection. Pass this whenever the IDE has no board selected, so the agent can compile autonomously.',
+      },
+    },
+    execute(params, context) {
+      const fqbnOverride = ((params['fqbn'] as string) || '').trim();
+      const ctx = fqbnOverride ? { ...context, boardFqbn: fqbnOverride } : context;
+      return Promise.resolve(runCompile(ctx));
     },
   };
 }
@@ -261,6 +287,44 @@ function makeSuggestLibraryTool(): AgentTool {
   };
 }
 
+function makeInstallLibraryTool(): AgentTool {
+  return {
+    name: 'install_library',
+    description:
+      'Install an Arduino library by exact name from the Library Manager. Call this when compilation fails with "fatal error: <Header.h>: No such file or directory" — pick the library name that provides that header (e.g. "DHT sensor library" for DHT.h, "Adafruit SSD1306" for Adafruit_SSD1306.h, "ArduinoJson" for ArduinoJson.h). After install succeeds, retry compile.',
+    parameters: {
+      name: {
+        type: 'string',
+        description:
+          'Exact library name as registered in the Arduino Library Manager (e.g. "DHT sensor library", "Adafruit GFX Library").',
+      },
+    },
+    required: ['name'],
+    async execute(params) {
+      const libName = (params['name'] as string) || '';
+      if (!libName.trim()) {
+        return { success: false, output: 'install_library: name parameter is required.' };
+      }
+      const cli = fs.existsSync(arduinoCliPath) ? arduinoCliPath : 'arduino-cli';
+      const result = spawnSync(cli, ['lib', 'install', libName], {
+        encoding: 'utf-8',
+        timeout: 120_000,
+      });
+      const output = [result.stdout, result.stderr].filter(Boolean).join('\n').trim();
+      if (result.status === 0) {
+        return {
+          success: true,
+          output: output || `Installed library "${libName}" ✓ — now retry compile.`,
+        };
+      }
+      return {
+        success: false,
+        output: output || `Library install failed for "${libName}" (exit ${result.status})`,
+      };
+    },
+  };
+}
+
 // ─── CLI subprocess helpers ──────────────────────────────────────────────────
 
 function runCompile(context: AgentContext): ToolResult {
@@ -270,7 +334,8 @@ function runCompile(context: AgentContext): ToolResult {
   if (!context.boardFqbn) {
     return {
       success: false,
-      output: 'No board selected. Select a board from the dropdown in the IDE toolbar.',
+      output:
+        'No board selected in the IDE. Retry this compile call with an `fqbn` parameter — for an Arduino UNO use "arduino:avr:uno", for a Nano use "arduino:avr:nano", for an ESP32 dev board use "esp32:esp32:esp32". Do not stop and ask the user; pick the FQBN from their original request and call compile again.',
     };
   }
   const cli = fs.existsSync(arduinoCliPath) ? arduinoCliPath : 'arduino-cli';

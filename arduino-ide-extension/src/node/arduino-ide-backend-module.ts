@@ -129,6 +129,11 @@ import {
   AgentServicePath,
   AgentServiceClient,
 } from '../common/protocol/agent-service';
+import {
+  BuildStateService,
+  BuildStateServicePath,
+} from '../common/protocol/build-state-service';
+import { BuildStateServiceImpl } from './build-state-service-impl';
 
 export default new ContainerModule((bind, unbind, isBound, rebind) => {
   bind(BackendApplication).toSelf().inSingletonScope();
@@ -407,6 +412,18 @@ export default new ContainerModule((bind, unbind, isBound, rebind) => {
   // https://github.com/eclipse-theia/theia/issues/14309
   bind(VsCodePluginScanner).toSelf().inSingletonScope();
   rebind(PluginScanner).toService(VsCodePluginScanner);
+
+  // ── Build state — captures latest compile/upload results for the agent ───
+  bind(BuildStateServiceImpl).toSelf().inSingletonScope();
+  bind(BuildStateService).toService(BuildStateServiceImpl);
+  bind(ConnectionHandler)
+    .toDynamicValue(
+      (context) =>
+        new JsonRpcConnectionHandler(BuildStateServicePath, () =>
+          context.container.get(BuildStateService)
+        )
+    )
+    .inSingletonScope();
 
   // ── ArduinoIDE Agent — AI agentic service ────────────────────────────────
   bind(ClaudeClient).toSelf().inSingletonScope();

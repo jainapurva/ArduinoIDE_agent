@@ -1,6 +1,10 @@
 import '../../src/browser/style/index.css';
 import { AgentPanelWidget } from './agent/agent-panel-widget';
 import { AgentViewContribution } from './agent/agent-view-contribution';
+import {
+  BuildStateService,
+  BuildStateServicePath,
+} from '../common/protocol/build-state-service';
 import { Container, ContainerModule } from '@theia/core/shared/inversify';
 import { WidgetFactory } from '@theia/core/lib/browser/widget-manager';
 import { CommandContribution } from '@theia/core/lib/common/command';
@@ -1082,5 +1086,15 @@ export default new ContainerModule((bind, unbind, isBound, rebind) => {
       id: AgentPanelWidget.ID,
       createWidget: () => ctx.container.get(AgentPanelWidget),
     }))
+    .inSingletonScope();
+
+  // ── Build state — frontend proxy for latest build results ─────────────
+  bind(BuildStateService)
+    .toDynamicValue((context) =>
+      WebSocketConnectionProvider.createProxy(
+        context.container,
+        BuildStateServicePath
+      )
+    )
     .inSingletonScope();
 });

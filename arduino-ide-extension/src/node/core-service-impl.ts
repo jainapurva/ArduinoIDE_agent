@@ -54,6 +54,7 @@ import { ExecuteWithProgress, ProgressResponse } from './grpc-progressible';
 import { MonitorManager } from './monitor-manager';
 import { ServiceError } from './service-error';
 import { AutoFlushingBuffer } from './utils/buffers';
+import { BuildStateService } from '../common/protocol/build-state-service';
 
 namespace Uploadable {
   export type Request = UploadRequest | UploadUsingProgrammerRequest;
@@ -70,6 +71,8 @@ export class CoreServiceImpl extends CoreClientAware implements CoreService {
   private readonly monitorManager: MonitorManager;
   @inject(BoardDiscovery)
   private readonly boardDiscovery: BoardDiscovery;
+  @inject(BuildStateService)
+  private readonly buildStateService: BuildStateService;
 
   async compile(
     options: CoreService.Options.Compile,
@@ -130,6 +133,13 @@ export class CoreServiceImpl extends CoreClientAware implements CoreService {
             .filter(notEmpty)
             .shift() ?? error.details
         );
+        const buildOutput = this.extractHandlerContent(handler.content);
+        this.buildStateService.setLastBuild({
+          output: buildOutput,
+          errors: error.details + '\n\n' + message,
+          timestamp: new Date().toISOString(),
+          success: false,
+        });
         this.sendResponse(
           error.details + '\n\n' + message,
           OutputMessage.Severity.Error
@@ -163,6 +173,13 @@ export class CoreServiceImpl extends CoreClientAware implements CoreService {
           .on('error', handleError)
           .on('end', () => {
             if (isCompileSummary(compileSummary)) {
+              const buildOutput = this.extractHandlerContent(handler.content);
+              this.buildStateService.setLastBuild({
+                output: buildOutput,
+                errors: '',
+                timestamp: new Date().toISOString(),
+                success: true,
+              });
               resolve(compileSummary);
             } else {
               console.error(
@@ -324,6 +341,13 @@ export class CoreServiceImpl extends CoreClientAware implements CoreService {
               error.details
             );
 
+            const uploadBuildOutput = this.extractHandlerContent(handler.content);
+            this.buildStateService.setLastBuild({
+              output: uploadBuildOutput,
+              errors: error.details,
+              timestamp: new Date().toISOString(),
+              success: false,
+            });
             this.sendResponse(error.details, OutputMessage.Severity.Error);
             reject(
               errorCtor(
@@ -337,6 +361,13 @@ export class CoreServiceImpl extends CoreClientAware implements CoreService {
           })
           .on('end', () => {
             if (isUploadResponse(uploadResponseFragment)) {
+              const uploadOutput = this.extractHandlerContent(handler.content);
+              this.buildStateService.setLastBuild({
+                output: uploadOutput,
+                errors: '',
+                timestamp: new Date().toISOString(),
+                success: true,
+              });
               resolve(uploadResponseFragment);
             } else {
               reject(
@@ -500,6 +531,16 @@ export class CoreServiceImpl extends CoreClientAware implements CoreService {
       content,
       onData,
     };
+  }
+
+  private extractHandlerContent(content: Uint8Array[]): string {
+    try {
+      return Buffer.concat(
+        content.map((c) => (c instanceof Buffer ? c : Buffer.from(c)))
+      ).toString('utf-8');
+    } catch {
+      return '';
+    }
   }
 
   private sendResponse(

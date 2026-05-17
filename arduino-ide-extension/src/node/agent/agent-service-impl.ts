@@ -18,6 +18,8 @@ import {
   AgentContext,
   AgentSession,
   AgentMessage,
+  SketchFile,
+  FileChange,
 } from '../../common/protocol/agent-service';
 import { ClaudeClient, ClaudeMessage } from './claude-client';
 import { AgentToolRegistry } from './agent-tools';
@@ -44,6 +46,10 @@ export class AgentServiceImpl implements AgentService {
 
   private readonly sessions: Map<string, AgentSession> = new Map();
   private readonly abortFlags: Map<string, boolean> = new Map();
+  private readonly pendingFileChanges: Map<
+    string,
+    { resolve: (accepted: boolean) => void }
+  > = new Map();
 
   @postConstruct()
   init(): void {
@@ -86,6 +92,18 @@ export class AgentServiceImpl implements AgentService {
     const session = this.sessions.get(sessionId);
     if (session) {
       session.isRunning = false;
+    }
+  }
+
+  async resolveFileChange(changeId: string, accepted: boolean): Promise<void> {
+    const pending = this.pendingFileChanges.get(changeId);
+    if (pending) {
+      pending.resolve(accepted);
+      this.pendingFileChanges.delete(changeId);
+    } else {
+      this.logger.warn(
+        `[AgentService] resolveFileChange called for unknown changeId: ${changeId}`
+      );
     }
   }
 
@@ -160,30 +178,101 @@ export class AgentServiceImpl implements AgentService {
               toolCall.input as Record<string, unknown>
             );
 
-            const result = await this.toolRegistry.execute(
-              toolCall.name,
-              toolCall.input as Record<string, unknown>,
-              enrichedContext
-            );
+            // ── Intercept write_file: show diff and wait for user approval ──
+            if (toolCall.name === 'write_file' && enrichedContext.sketchPath) {
+              const params = toolCall.input as Record<string, unknown>;
+              const filename = params['filename'] as string;
+              const newContent = params['content'] as string;
+              const filepath = path.join(enrichedContext.sketchPath, filename);
 
-            this.client?.onToolEnd(sessionId, toolCall.name, result.output, result.success);
+              // Read old content (empty string if new file)
+              let oldContent = '';
+              try {
+                if (fs.existsSync(filepath)) {
+                  oldContent = fs.readFileSync(filepath, 'utf-8');
+                }
+              } catch {
+                // treat as new file
+              }
 
-            // Append tool result to history
-            const toolMsg = `Tool [${toolCall.name}] ${result.success ? 'result' : 'ERROR'}:\n${result.output}`;
-            history.push({ role: 'user', content: toolMsg });
+              const changeId = uid();
+              const fileChange: FileChange = {
+                sessionId,
+                changeId,
+                filename,
+                oldContent,
+                newContent,
+                sketchPath: enrichedContext.sketchPath,
+              };
 
-            session.messages.push({
-              id: uid(),
-              role: 'tool',
-              content: result.output,
-              timestamp: new Date().toISOString(),
-              toolName: toolCall.name,
-              toolStatus: result.success ? 'success' : 'error',
-            });
+              // Send diff to frontend so user sees what was written.
+              // Agent is autonomous: auto-accept after a short visual pause
+              // (~1.2s) — long enough to read, short enough to keep the flow
+              // running. Manual Accept/Reject still works during that window.
+              this.client?.onFileChange(fileChange);
 
-            // After write_file, refresh sketch code in context
-            if (toolCall.name === 'write_file') {
-              enrichedContext.sketchCode = this.readSketchCode(enrichedContext.sketchPath);
+              const accepted = await new Promise<boolean>((resolve) => {
+                this.pendingFileChanges.set(changeId, { resolve });
+                // Auto-accept timer
+                setTimeout(() => {
+                  if (this.pendingFileChanges.has(changeId)) {
+                    this.pendingFileChanges.delete(changeId);
+                    resolve(true);
+                  }
+                }, 1200);
+              });
+
+              let toolOutput: string;
+              let toolSuccess: boolean;
+
+              if (accepted) {
+                fs.mkdirSync(path.dirname(filepath), { recursive: true });
+                fs.writeFileSync(filepath, newContent, 'utf-8');
+                toolOutput = `Written ${filename} (${newContent.length} chars)`;
+                toolSuccess = true;
+              } else {
+                toolOutput = `User rejected the changes to ${filename}`;
+                toolSuccess = false;
+              }
+
+              this.client?.onToolEnd(sessionId, toolCall.name, toolOutput, toolSuccess);
+
+              const toolMsg = `Tool [${toolCall.name}] ${toolSuccess ? 'result' : 'ERROR'}:\n${toolOutput}`;
+              history.push({ role: 'user', content: toolMsg });
+              session.messages.push({
+                id: uid(),
+                role: 'tool',
+                content: toolOutput,
+                timestamp: new Date().toISOString(),
+                toolName: toolCall.name,
+                toolStatus: toolSuccess ? 'success' : 'error',
+              });
+
+              if (accepted) {
+                enrichedContext.sketchCode = this.readSketchCode(enrichedContext.sketchPath);
+                enrichedContext.sketchFiles = this.readSketchFiles(enrichedContext.sketchPath);
+              }
+            } else {
+              // All other tools: execute normally
+              const result = await this.toolRegistry.execute(
+                toolCall.name,
+                toolCall.input as Record<string, unknown>,
+                enrichedContext
+              );
+
+              this.client?.onToolEnd(sessionId, toolCall.name, result.output, result.success);
+
+              const toolMsg = `Tool [${toolCall.name}] ${result.success ? 'result' : 'ERROR'}:\n${result.output}`;
+              history.push({ role: 'user', content: toolMsg });
+
+              session.messages.push({
+                id: uid(),
+                role: 'tool',
+                content: result.output,
+                timestamp: new Date().toISOString(),
+                toolName: toolCall.name,
+                toolStatus: result.success ? 'success' : 'error',
+              });
             }
           }
           continue; // Let Claude respond to tool results
@@ -224,10 +313,12 @@ export class AgentServiceImpl implements AgentService {
   // ─── Context enrichment ───────────────────────────────────────────────────
 
   private enrichContext(context: AgentContext): AgentContext {
-    const enriched = { ...context };
-    // Read sketch code from disk (frontend only passes the path)
-    if (enriched.sketchPath && !enriched.sketchCode) {
-      enriched.sketchCode = this.readSketchCode(enriched.sketchPath);
+    const enriched = { ...context, sketchFiles: [] as SketchFile[] };
+    if (enriched.sketchPath) {
+      if (!enriched.sketchCode) {
+        enriched.sketchCode = this.readSketchCode(enriched.sketchPath);
+      }
+      enriched.sketchFiles = this.readSketchFiles(enriched.sketchPath);
     }
     return enriched;
   }
@@ -235,13 +326,11 @@ export class AgentServiceImpl implements AgentService {
   private readSketchCode(sketchPath: string): string {
     if (!sketchPath) return '';
     try {
-      // Find the .ino file in the sketch directory
       const sketchName = path.basename(sketchPath);
       const inoPath = path.join(sketchPath, `${sketchName}.ino`);
       if (fs.existsSync(inoPath)) {
         return fs.readFileSync(inoPath, 'utf-8');
       }
-      // Fallback: read first .ino file
       const files = fs.readdirSync(sketchPath).filter((f) => f.endsWith('.ino'));
       if (files.length > 0) {
         return fs.readFileSync(path.join(sketchPath, files[0]), 'utf-8');
@@ -252,12 +341,45 @@ export class AgentServiceImpl implements AgentService {
     return '';
   }
 
+  private readSketchFiles(sketchPath: string): SketchFile[] {
+    if (!sketchPath) return [];
+    try {
+      const extensions = ['.ino', '.cpp', '.c', '.h', '.hpp', '.S'];
+      const files = fs.readdirSync(sketchPath)
+        .filter((f) => extensions.some((ext) => f.endsWith(ext)));
+      return files.map((filename) => ({
+        filename,
+        content: fs.readFileSync(path.join(sketchPath, filename), 'utf-8'),
+      }));
+    } catch {
+      return [];
+    }
+  }
+
   // ─── System Prompt ─────────────────────────────────────────────────────────
 
   private buildSystemPrompt(ctx: AgentContext): string {
     const boardInfo = ctx.boardName
       ? `${ctx.boardName} (FQBN: ${ctx.boardFqbn})`
       : ctx.boardFqbn || 'not selected';
+
+    // Build sketch files section — show all files, truncate large ones.
+    let sketchSection: string;
+    if (ctx.sketchFiles && ctx.sketchFiles.length > 0) {
+      const fileBlocks = ctx.sketchFiles.map((f) => {
+        const lines = f.content.split('\n');
+        const truncated = lines.length > 200;
+        const shown = truncated
+          ? lines.slice(0, 200).join('\n') + `\n// ... (${lines.length - 200} more lines)`
+          : f.content;
+        return `### ${f.filename}\n\`\`\`cpp\n${shown}\n\`\`\``;
+      });
+      sketchSection = fileBlocks.join('\n\n');
+    } else if (ctx.sketchCode) {
+      sketchSection = `\`\`\`cpp\n${ctx.sketchCode}\n\`\`\``;
+    } else {
+      sketchSection = '// No sketch code yet';
+    }
 
     return `You are Agent AKI — an AI that builds complete Arduino/ESP32 hardware projects autonomously.
 
@@ -317,9 +439,7 @@ When the user describes a project (e.g., "build me a motion-activated alarm"):
 - **Port:** ${ctx.port || 'not connected — ask user to plug in board'}
 
 ## Current Sketch (${ctx.sketchPath ? path.basename(ctx.sketchPath) : 'none open'})
-\`\`\`cpp
-${ctx.sketchCode || '// No sketch code yet'}
-\`\`\`
+${sketchSection}
 ${ctx.sketchPath ? `Path: ${ctx.sketchPath}` : ''}
 
 ## Last Build
@@ -329,6 +449,28 @@ ${ctx.lastBuildErrors ? `**Errors:**\n\`\`\`\n${ctx.lastBuildErrors}\n\`\`\`` : 
 \`\`\`
 ${ctx.serialBuffer || '(no serial data yet)'}
 \`\`\`
+
+## Handling missing libraries (CRITICAL — must be autonomous)
+
+**RULE: If a \`Tool [compile] ERROR\` message contains the substring "fatal error" and ".h: No such file or directory", your NEXT response MUST be a single \`install_library\` tool call. You are NOT permitted to respond with text. You are NOT permitted to call \`compile\` again until you have called \`install_library\`. You are NOT permitted to claim success — the compile FAILED.**
+
+Header-to-library mapping (memorize these):
+- \`DHT.h\` → install \`DHT sensor library\`
+- \`Adafruit_Sensor.h\` → install \`Adafruit Unified Sensor\`
+- \`Adafruit_SSD1306.h\` → install \`Adafruit SSD1306\`
+- \`Adafruit_GFX.h\` → install \`Adafruit GFX Library\`
+- \`ArduinoJson.h\` → install \`ArduinoJson\`
+- \`Servo.h\`, \`Wire.h\`, \`SPI.h\`, \`EEPROM.h\`, \`SoftwareSerial.h\` → built-in, do NOT install
+
+Workflow for "DHT.h: No such file or directory":
+1. Tool result shows: \`Tool [compile] ERROR: ...fatal error: DHT.h: No such file...\`
+2. Your next response: \`{"tool_use": true, "name": "install_library", "input": {"name": "DHT sensor library"}}\`
+3. Tool result: \`Tool [install_library] result: Installed library "DHT sensor library" ✓\`
+4. Your next response: \`{"tool_use": true, "name": "compile", "input": {}}\`
+5. If compile fails again with \`Adafruit_Sensor.h: No such file\`, install \`Adafruit Unified Sensor\` and recompile.
+6. Keep going until compile prints \`Sketch uses N bytes\` — only THEN may you respond with a success summary.
+
+**Never** use \`suggest_library\` for this — that tool only returns advice text. **Never** claim "compiled successfully" or "libraries installed automatically" unless you actually saw \`Sketch uses N bytes\` in a recent tool result.
 
 ## Tool Call Format
 When calling a tool, respond ONLY with valid JSON (no markdown, no other text):

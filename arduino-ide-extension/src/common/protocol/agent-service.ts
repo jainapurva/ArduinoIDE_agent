@@ -31,10 +31,29 @@ export interface AgentSession {
   iterationCount: number;
 }
 
+// ─── Sketch file ─────────────────────────────────────────────────────────────
+
+export interface SketchFile {
+  filename: string;
+  content: string;
+}
+
+// ─── File change (diff view) ─────────────────────────────────────────────────
+
+export interface FileChange {
+  sessionId: string;
+  changeId: string;
+  filename: string;
+  oldContent: string;
+  newContent: string;
+  sketchPath: string;
+}
+
 // ─── Context snapshot (injected into system prompt) ──────────────────────────
 
 export interface AgentContext {
   sketchCode: string;
+  sketchFiles: SketchFile[];
   sketchPath: string;
   boardFqbn: string;
   boardName: string;
@@ -64,6 +83,9 @@ export interface AgentService {
 
   /** Clear session history */
   clearSession(sessionId: string): Promise<void>;
+
+  /** Accept or reject a proposed file change (diff view) */
+  resolveFileChange(changeId: string, accepted: boolean): Promise<void>;
 }
 
 // ─── Notification client (backend → frontend streaming) ──────────────────────
@@ -89,4 +111,7 @@ export interface AgentServiceClient {
 
   /** Agent loop error */
   onError(sessionId: string, error: string): void;
+
+  /** File change proposed — frontend should show diff */
+  onFileChange(change: FileChange): void;
 }

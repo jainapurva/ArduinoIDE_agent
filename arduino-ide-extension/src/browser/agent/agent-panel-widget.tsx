@@ -11,16 +11,21 @@ import {
 } from '@theia/core/shared/inversify';
 import { ReactWidget, Message } from '@theia/core/lib/browser';
 import { WebSocketConnectionProvider } from '@theia/core/lib/browser/messaging/ws-connection-provider';
+import { OpenerService, open } from '@theia/core/lib/browser/opener-service';
+import URI from '@theia/core/lib/common/uri';
 import {
   AgentService,
   AgentServicePath,
   AgentServiceClient,
   AgentMessage,
   AgentContext,
+  FileChange,
 } from '../../common/protocol/agent-service';
 import { BoardsServiceProvider } from '../boards/boards-service-provider';
 import { SketchesServiceClientImpl } from '../sketches-service-client-impl';
 import { MonitorModel } from '../monitor-model';
+import { BuildStateService } from '../../common/protocol/build-state-service';
+import { OutputChannelManager } from '../theia/output/output-channel';
 
 export const AGENT_PANEL_WIDGET_ID = 'arduino-agent-panel';
 export const AGENT_PANEL_WIDGET_LABEL = 'AI Agent';
@@ -33,6 +38,7 @@ interface ChatState {
   activeToolName: string | null;
   sessionId: string | null;
   error: string | null;
+  pendingChanges: FileChange[];
 }
 
 @injectable()
@@ -52,6 +58,15 @@ export class AgentPanelWidget extends ReactWidget implements AgentServiceClient 
   @inject(MonitorModel)
   private readonly monitorModel: MonitorModel;
 
+  @inject(BuildStateService)
+  private readonly buildStateService: BuildStateService;
+
+  @inject(OpenerService)
+  private readonly openerService: OpenerService;
+
+  @inject(OutputChannelManager)
+  private readonly outputChannelManager: OutputChannelManager;
+
   private agentService!: AgentService;
 
   private state: ChatState = {
@@ -62,6 +77,7 @@ export class AgentPanelWidget extends ReactWidget implements AgentServiceClient 
     activeToolName: null,
     sessionId: null,
     error: null,
+    pendingChanges: [],
   };
 
   @postConstruct()
@@ -95,15 +111,33 @@ export class AgentPanelWidget extends ReactWidget implements AgentServiceClient 
 
   onToolStart(_sessionId: string, toolName: string, _params: Record<string, unknown>): void {
     this.setState({ activeToolName: toolName });
+    if (toolName === 'compile' || toolName === 'upload') {
+      const channel = this.outputChannelManager.getChannel('Arduino');
+      channel.show({ preserveFocus: true });
+      channel.appendLine(`\n── agent: ${toolName} starting ──`);
+    }
   }
 
   onToolEnd(
     _sessionId: string,
-    _toolName: string,
-    _result: string,
-    _success: boolean
+    toolName: string,
+    result: string,
+    success: boolean
   ): void {
     this.setState({ activeToolName: null });
+    if (toolName === 'compile' || toolName === 'upload') {
+      const channel = this.outputChannelManager.getChannel('Arduino');
+      channel.appendLine(result || '(no output)');
+      channel.appendLine(`── ${toolName} ${success ? 'succeeded ✓' : 'failed ✗'} ──`);
+    }
+    // After auto-accept on the backend, the diff has served its purpose.
+    // Clear pending diffs once write_file finishes so the UI moves on.
+    if (toolName === 'write_file' && this.state.pendingChanges.length > 0) {
+      // Open the file in the editor first so the user sees what was applied.
+      const lastChange = this.state.pendingChanges[this.state.pendingChanges.length - 1];
+      this.openSketchFile(lastChange.sketchPath, lastChange.filename).catch(() => {});
+      this.setState({ pendingChanges: [] });
+    }
   }
 
   onMessage(_sessionId: string, message: AgentMessage): void {
@@ -119,6 +153,25 @@ export class AgentPanelWidget extends ReactWidget implements AgentServiceClient 
 
   onError(_sessionId: string, error: string): void {
     this.setState({ isRunning: false, error, streamingText: '', activeToolName: null });
+  }
+
+  onFileChange(change: FileChange): void {
+    this.setState({
+      pendingChanges: [...this.state.pendingChanges, change],
+    });
+    // Pre-open the target file in the editor so the user sees what the agent is about to modify.
+    this.openSketchFile(change.sketchPath, change.filename).catch(() => {
+      /* file may not exist yet — that's fine, will open after Accept */
+    });
+  }
+
+  private async openSketchFile(sketchPath: string, filename: string): Promise<void> {
+    if (!sketchPath || !filename) return;
+    const fullPath = sketchPath.endsWith('/')
+      ? `${sketchPath}${filename}`
+      : `${sketchPath}/${filename}`;
+    const uri = new URI(`file://${fullPath}`);
+    await open(this.openerService, uri, { mode: 'reveal' });
   }
 
   // ── State management ──────────────────────────────────────────────────────
@@ -171,7 +224,29 @@ export class AgentPanelWidget extends ReactWidget implements AgentServiceClient 
     if (this.state.sessionId) {
       await this.agentService.clearSession(this.state.sessionId);
     }
-    this.setState({ messages: [], streamingText: '', error: null });
+    this.setState({ messages: [], streamingText: '', error: null, pendingChanges: [] });
+  };
+
+  private readonly handleAcceptChange = async (changeId: string) => {
+    const change = this.state.pendingChanges.find((c) => c.changeId === changeId);
+    await this.agentService.resolveFileChange(changeId, true);
+    this.setState({
+      pendingChanges: this.state.pendingChanges.filter((c) => c.changeId !== changeId),
+    });
+    // After backend writes the file, open/reveal it in the editor so the user sees the new content.
+    if (change) {
+      // small delay lets Theia's file watcher pick up the change before we reveal
+      setTimeout(() => {
+        this.openSketchFile(change.sketchPath, change.filename).catch(() => {});
+      }, 150);
+    }
+  };
+
+  private readonly handleRejectChange = async (changeId: string) => {
+    await this.agentService.resolveFileChange(changeId, false);
+    this.setState({
+      pendingChanges: this.state.pendingChanges.filter((c) => c.changeId !== changeId),
+    });
   };
 
   /**
@@ -201,14 +276,28 @@ export class AgentPanelWidget extends ReactWidget implements AgentServiceClient 
     // Serial buffer from MonitorModel (last 200 lines)
     const serialBuffer = this.getSerialBuffer();
 
+    // Fetch latest build state
+    let lastBuildOutput = '';
+    let lastBuildErrors = '';
+    try {
+      const lastBuild = await this.buildStateService.getLastBuild();
+      if (lastBuild) {
+        lastBuildOutput = lastBuild.output;
+        lastBuildErrors = lastBuild.errors;
+      }
+    } catch {
+      // Not critical — agent works without build context
+    }
+
     return {
       sketchCode: '', // filled server-side from sketchPath
+      sketchFiles: [], // filled server-side from sketchPath
       sketchPath,
       boardFqbn: selectedBoard?.fqbn ?? '',
       boardName: selectedBoard?.name ?? '',
       port: selectedPort?.address ?? '',
-      lastBuildOutput: '',
-      lastBuildErrors: '',
+      lastBuildOutput,
+      lastBuildErrors,
       serialBuffer,
     };
   }
@@ -332,6 +421,11 @@ export class AgentPanelWidget extends ReactWidget implements AgentServiceClient 
             </div>
           )}
 
+          {/* Pending file change diffs */}
+          {this.state.pendingChanges.map((change) =>
+            this.renderDiffView(change)
+          )}
+
           {/* Error */}
           {error && (
             <div className="agent-error">
@@ -409,6 +503,94 @@ export class AgentPanelWidget extends ReactWidget implements AgentServiceClient 
         </div>
       </div>
     );
+  }
+
+  private renderDiffView(change: FileChange): React.ReactNode {
+    const isNew = change.oldContent === '';
+    const label = isNew ? '(new file)' : '(modified)';
+    const diffLines = this.computeDiff(change.oldContent, change.newContent);
+
+    return (
+      <div key={change.changeId} className="agent-diff">
+        <div className="agent-diff__header">
+          <span className="codicon codicon-diff" />{' '}
+          {change.filename} {label}
+        </div>
+        <div className="agent-diff__body">
+          {diffLines.map((line, i) => (
+            <div
+              key={i}
+              className={`agent-diff__line agent-diff__line--${line.type}`}
+            >
+              <span className="agent-diff__line-prefix">
+                {line.type === 'added' ? '+' : line.type === 'removed' ? '-' : ' '}
+              </span>
+              <span className="agent-diff__line-text">{line.text}</span>
+            </div>
+          ))}
+        </div>
+        <div className="agent-diff__actions">
+          <button
+            className="agent-btn agent-btn--accept"
+            onClick={() => this.handleAcceptChange(change.changeId)}
+          >
+            <span className="codicon codicon-check" /> Accept
+          </button>
+          <button
+            className="agent-btn agent-btn--reject"
+            onClick={() => this.handleRejectChange(change.changeId)}
+          >
+            <span className="codicon codicon-close" /> Reject
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  private computeDiff(
+    oldContent: string,
+    newContent: string
+  ): Array<{ type: 'added' | 'removed' | 'context'; text: string }> {
+    const oldLines = oldContent.split('\n');
+    const newLines = newContent.split('\n');
+
+    // Simple LCS-based line diff
+    const m = oldLines.length;
+    const n = newLines.length;
+
+    const dp: number[][] = Array.from({ length: m + 1 }, () =>
+      new Array(n + 1).fill(0)
+    );
+    for (let i = 1; i <= m; i++) {
+      for (let j = 1; j <= n; j++) {
+        if (oldLines[i - 1] === newLines[j - 1]) {
+          dp[i][j] = dp[i - 1][j - 1] + 1;
+        } else {
+          dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+        }
+      }
+    }
+
+    // Backtrack to produce diff
+    const diff: Array<{ type: 'added' | 'removed' | 'context'; text: string }> = [];
+    let i = m;
+    let j = n;
+    while (i > 0 || j > 0) {
+      if (i > 0 && j > 0 && oldLines[i - 1] === newLines[j - 1]) {
+        diff.push({ type: 'context', text: oldLines[i - 1] });
+        i--;
+        j--;
+      } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+        diff.push({ type: 'added', text: newLines[j - 1] });
+        j--;
+      } else {
+        diff.push({ type: 'removed', text: oldLines[i - 1] });
+        i--;
+      }
+    }
+
+    diff.reverse();
+    return diff;
   }
 }
 
